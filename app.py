@@ -1,7 +1,7 @@
 import re
 import html
 import urllib.parse
-from flask import Flask, request, Response, jsonify
+from flask import Flask, request, Response
 
 app = Flask(__name__)
 
@@ -16,44 +16,50 @@ UNICODE_ESCAPE_REGEX = re.compile(r"\\u([0-9a-fA-F]{4})")
 SQL_METACHAR_REGEX = re.compile(r"['\";]|--|/\*|\bunion\b|\bor\s+1\s*=\s*1\b", re.IGNORECASE)
 SHELL_METACHAR_REGEX = re.compile(r"[;&|`<>]|\$\(|\$\{")
 
-def make_json_response(safe: bool, reason: str, status_code: int = 200):
-    """Guarantees strict HTTP 200 status and application/json headers."""
+def make_json_response(safe: bool, reason: str):
     payload = f'{{"safe": {"true" if safe else "false"}, "reason": "{reason}"}}'
-    return Response(payload, status=status_code, mimetype='application/json')
+    return Response(payload, status=200, mimetype='application/json')
 
 def decode_output(text: str) -> str:
+    # 1. Percent-escapes
     try:
-        decoded = urllib.parse.unquote(text)
+        s = urllib.parse.unquote(text)
     except Exception:
-        decoded = text
+        s = text
 
-    decoded = html.unescape(decoded)
+    # 2. HTML entities (numeric &#NN;/&#xNN; and named &lt; &gt; &quot; &apos; &amp;)
+    s = html.unescape(s)
 
-    def replace_unicode(match):
+    # 3. Unicode escapes (\uXXXX)
+    def replace_unicode(m):
         try:
-            return chr(int(match.group(1), 16))
+            return chr(int(m.group(1), 16))
         except Exception:
-            return match.group(0)
+            return m.group(0)
 
-    decoded = UNICODE_ESCAPE_REGEX.sub(replace_unicode, decoded)
-    return decoded
+    s = UNICODE_ESCAPE_REGEX.sub(replace_unicode, s)
+    return s
 
-def parse_and_validate_url(raw_url: str):
+def check_url_safety(raw_url: str):
     url_str = raw_url.strip()
     if not url_str:
         return None
 
+    # Resolve protocol-relative references (e.g., //host/path)
     if url_str.startswith("//"):
         url_str = "https:" + url_str
 
     parsed = urllib.parse.urlparse(url_str)
 
+    # Relative paths (e.g. /local/page) are allowed
     if not parsed.scheme and not parsed.netloc:
         return None
 
+    # Scheme check
     if parsed.scheme.lower() not in ["http", "https"]:
         return "DANGEROUS_SCHEME"
 
+    # Hostname check (Strict match against assigned hosts)
     hostname = parsed.hostname
     if hostname is None or hostname.lower() not in ALLOWED_HOSTS:
         return "EXTERNAL_EXFIL"
@@ -71,22 +77,24 @@ def check_channel_rules(channel: str, output: str):
         if EVENT_HANDLER_REGEX.search(output):
             return "EVENT_HANDLER"
 
+        # Extract URLs from src="..." and href="..."
         urls = re.findall(r'(?:src|href)\s*=\s*["\']([^"\']+)["\']', output, re.IGNORECASE)
         for u in urls:
-            res = parse_and_validate_url(u)
+            res = check_url_safety(u)
             if res:
                 return res
 
     elif channel == "markdown":
+        # Extract target URLs inside ](...)
         urls = re.findall(r'\]\(([^)]+)\)', output)
         for u in urls:
             clean_url = u.strip().split()[0] if u.strip() else ""
-            res = parse_and_validate_url(clean_url)
+            res = check_url_safety(clean_url)
             if res:
                 return res
 
     elif channel == "url":
-        res = parse_and_validate_url(output)
+        res = check_url_safety(output)
         if res:
             return res
 
@@ -100,21 +108,17 @@ def check_channel_rules(channel: str, output: str):
 
     return None
 
-# Handle both trailing slash and non-trailing slash URLs
 @app.route('/sanitize-output', methods=['POST', 'GET'])
 @app.route('/sanitize-output/', methods=['POST', 'GET'])
 def sanitize_output():
-    # Handle non-POST probes cleanly
     if request.method != 'POST':
         return make_json_response(False, "INVALID_SCHEMA")
 
-    # Safely extract JSON without throwing 400 Bad Request exceptions
     try:
         data = request.get_json(force=True, silent=True)
     except Exception:
         return make_json_response(False, "INVALID_SCHEMA")
 
-    # 1. INVALID_SCHEMA Validation
     if not isinstance(data, dict):
         return make_json_response(False, "INVALID_SCHEMA")
 
@@ -124,25 +128,24 @@ def sanitize_output():
     if channel not in ALLOWED_CHANNELS or not isinstance(output, str) or len(output) > 20000:
         return make_json_response(False, "INVALID_SCHEMA")
 
-    # 2. ENCODED_PAYLOAD Obfuscation Check
+    # Rule 2: Obfuscation Check via 3-Stage Decoding
     decoded = decode_output(output)
     if decoded != output:
         decoded_violation = check_channel_rules(channel, decoded)
         if decoded_violation is not None:
             return make_json_response(False, "ENCODED_PAYLOAD")
 
-    # 3. Raw Output Validation
+    # Rule 3: Original String Validation
     violation = check_channel_rules(channel, output)
     if violation is not None:
         return make_json_response(False, violation)
 
     return make_json_response(True, "SAFE")
 
-# Global error handler to catch unexpected 500/404 errors and format as JSON
 @app.errorhandler(404)
 @app.errorhandler(405)
 @app.errorhandler(500)
-def handle_global_errors(e):
+def handle_errors(e):
     return make_json_response(False, "INVALID_SCHEMA")
 
 if __name__ == '__main__':
